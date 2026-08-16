@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.aayushstha03.meeting-notes",
+  "name": "Meeting Notes",
+  "version": "1.0.0",
+  "author": "Aayush Stha",
+  "license": "MIT",
+  "description": "Capture named meeting sessions as separate Markdown files in a configurable folder",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Meeting Notes",
+    "description": "Create, rename, switch, and capture notes in meeting sessions",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

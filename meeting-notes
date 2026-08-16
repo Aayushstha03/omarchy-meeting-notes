@@ -1,0 +1,456 @@
+#!/usr/bin/env python3
+"""Local meeting/session store for the Meeting Notes Omarchy widget."""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "omarchy-meeting-notes"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "omarchy"
+CONFIG_PATH = CONFIG_DIR / "meeting-notes.json"
+JSONL_PATH = DATA_DIR / "notes.jsonl"
+MEETINGS_PATH = DATA_DIR / "meetings.json"
+AUTHOR_PATH = DATA_DIR / "last-author"
+DELETED_DIR = DATA_DIR / "deleted"
+DEFAULT_OUTPUT_DIR = Path(os.environ.get("MEETING_NOTES_DIR", Path.home() / "Documents/Meeting Notes"))
+
+
+def now_iso():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def clean(value):
+    return " ".join(str(value).split())
+
+
+def read_entries():
+    if not JSONL_PATH.exists():
+        return []
+    result = []
+    for line in JSONL_PATH.read_text(encoding="utf-8").splitlines():
+        try:
+            item = json.loads(line)
+            if isinstance(item, dict):
+                result.append(item)
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return result
+
+
+def write_entries(all_entries):
+    payload = "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in all_entries)
+    JSONL_PATH.write_text(payload, encoding="utf-8")
+
+
+def default_meeting_name(all_entries=None):
+    moment = datetime.now().astimezone()
+    if all_entries:
+        try:
+            moment = datetime.fromisoformat(all_entries[0]["timestamp"])
+        except (KeyError, TypeError, ValueError):
+            pass
+    return "new-meeting " + moment.strftime("%d/%m/%y")
+
+
+def meeting_filename(meeting):
+    try:
+        date = datetime.fromisoformat(meeting["created_at"]).strftime("%Y-%m-%d")
+    except (KeyError, TypeError, ValueError):
+        date = datetime.now().strftime("%Y-%m-%d")
+    slug = re.sub(r"[^\w]+", "-", clean(meeting.get("name", "")).lower(), flags=re.UNICODE).strip("-")
+    slug = slug[:60].rstrip("-") or "meeting"
+    suffix = str(meeting.get("id", "meeting"))[-8:]
+    return f"{date}-{slug}-{suffix}.md"
+
+
+def save_config(directory):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = CONFIG_PATH.with_suffix(".json.tmp")
+    payload = {"notesDirectory": str(directory)}
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(CONFIG_PATH)
+
+
+def output_dir():
+    configured = str(DEFAULT_OUTPUT_DIR)
+    if CONFIG_PATH.exists():
+        try:
+            candidate = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(candidate, dict) and candidate.get("notesDirectory"):
+                configured = str(candidate["notesDirectory"])
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return Path(os.path.expandvars(configured)).expanduser()
+
+
+def meeting_path(meeting):
+    return output_dir() / meeting["file_name"]
+
+
+def save_store(store):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = MEETINGS_PATH.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(store, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(MEETINGS_PATH)
+
+
+def load_store():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    all_entries = read_entries()
+    store = None
+    if MEETINGS_PATH.exists():
+        try:
+            candidate = json.loads(MEETINGS_PATH.read_text(encoding="utf-8"))
+            if isinstance(candidate, dict) and isinstance(candidate.get("meetings"), list):
+                store = candidate
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    if not store or not store["meetings"]:
+        created_at = all_entries[0].get("timestamp", now_iso()) if all_entries else now_iso()
+        legacy = {
+            "id": "meeting-" + uuid.uuid4().hex[:12],
+            "name": default_meeting_name(all_entries),
+            "created_at": created_at,
+            "updated_at": all_entries[-1].get("timestamp", created_at) if all_entries else created_at,
+        }
+        legacy["file_name"] = meeting_filename(legacy)
+        store = {
+            "version": 2,
+            "current_id": legacy["id"],
+            "meetings": [legacy],
+        }
+        for entry in all_entries:
+            entry["meeting_id"] = legacy["id"]
+        if all_entries:
+            write_entries(all_entries)
+        save_store(store)
+        rebuild_markdown(store, all_entries)
+
+    store_changed = False
+    if not CONFIG_PATH.exists():
+        save_config(Path(store.get("output_dir", DEFAULT_OUTPUT_DIR)).expanduser())
+    if "output_dir" in store:
+        store.pop("output_dir")
+        store_changed = True
+    if store.get("version") != 2:
+        store["version"] = 2
+        store_changed = True
+    for meeting in store["meetings"]:
+        if not meeting.get("file_name"):
+            meeting["file_name"] = meeting_filename(meeting)
+            store_changed = True
+
+    valid_ids = {meeting.get("id") for meeting in store["meetings"]}
+    if store.get("current_id") not in valid_ids:
+        store["current_id"] = store["meetings"][0]["id"]
+        store_changed = True
+    if store_changed:
+        save_store(store)
+        rebuild_markdown(store, all_entries)
+
+    # Pin any pre-session notes to the oldest meeting exactly once.
+    missing_ids = [entry for entry in all_entries if not entry.get("meeting_id")]
+    if missing_ids:
+        oldest_id = store["meetings"][0]["id"]
+        for entry in missing_ids:
+            entry["meeting_id"] = oldest_id
+        write_entries(all_entries)
+        rebuild_markdown(store, all_entries)
+    return store
+
+
+def current_meeting(store):
+    return next(meeting for meeting in store["meetings"] if meeting["id"] == store["current_id"])
+
+
+def display_time(value):
+    return datetime.fromisoformat(value).strftime("%I:%M %p").lstrip("0")
+
+
+def display_date(value):
+    return datetime.fromisoformat(value).strftime("%A, %B %-d, %Y")
+
+
+def rebuild_markdown(store, all_entries=None):
+    all_entries = read_entries() if all_entries is None else all_entries
+    destination = output_dir()
+    destination.mkdir(parents=True, exist_ok=True)
+    for meeting in store["meetings"]:
+        lines = [f"# {meeting['name']}", ""]
+        meeting_entries = [entry for entry in all_entries if entry.get("meeting_id") == meeting["id"]]
+        if not meeting_entries:
+            lines.append("_No notes yet._")
+        else:
+            current_day = None
+            for entry in meeting_entries:
+                day = display_date(entry["timestamp"])
+                if day != current_day:
+                    if current_day is not None:
+                        lines.append("")
+                    lines.extend([f"## {day}", ""])
+                    current_day = day
+                author = clean(entry.get("author", ""))
+                note = clean(entry.get("note", ""))
+                lines.append(f"- **{display_time(entry['timestamp'])}** — **{author}:** {note}")
+        meeting_path(meeting).write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def add(author, note):
+    author = clean(author)
+    note = clean(note)
+    if not author or not note:
+        raise ValueError("Author and note are both required")
+    store = load_store()
+    timestamp = now_iso()
+    entry = {
+        "timestamp": timestamp,
+        "meeting_id": store["current_id"],
+        "author": author,
+        "note": note,
+    }
+    with JSONL_PATH.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    AUTHOR_PATH.write_text(author + "\n", encoding="utf-8")
+    current_meeting(store)["updated_at"] = timestamp
+    save_store(store)
+    rebuild_markdown(store)
+    print(json.dumps(entry, ensure_ascii=False))
+
+
+def state(limit):
+    store = load_store()
+    current_id = store["current_id"]
+    all_entries = read_entries()
+    counts = {}
+    for entry in all_entries:
+        meeting_id = entry.get("meeting_id")
+        counts[meeting_id] = counts.get(meeting_id, 0) + 1
+    meetings = []
+    for meeting in reversed(store["meetings"]):
+        item = dict(meeting)
+        item["note_count"] = counts.get(meeting["id"], 0)
+        meetings.append(item)
+    matching = [entry for entry in all_entries if entry.get("meeting_id") == current_id]
+    recent = matching[-limit:] if limit > 0 else []
+    recent_result = []
+    for entry in reversed(recent):
+        item = dict(entry)
+        item["time"] = display_time(item["timestamp"])
+        recent_result.append(item)
+    print(json.dumps({
+        "current": current_meeting(store),
+        "meetings": meetings,
+        "recent_notes": recent_result,
+        "output_dir": str(output_dir()),
+        "current_path": str(meeting_path(current_meeting(store))),
+    }, ensure_ascii=False))
+
+
+def list_recent(limit):
+    """Print recent notes for the current meeting. `state` returns these plus session data."""
+    store = load_store()
+    current_id = store["current_id"]
+    matching = [entry for entry in read_entries() if entry.get("meeting_id") == current_id]
+    recent = matching[-limit:] if limit > 0 else []
+    result = []
+    for entry in reversed(recent):
+        item = dict(entry)
+        item["time"] = display_time(item["timestamp"])
+        result.append(item)
+    print(json.dumps(result, ensure_ascii=False))
+
+
+def create_meeting(name):
+    name = clean(name)
+    if not name:
+        name = default_meeting_name()
+    store = load_store()
+    timestamp = now_iso()
+    meeting = {
+        "id": "meeting-" + uuid.uuid4().hex[:12],
+        "name": name,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    }
+    meeting["file_name"] = meeting_filename(meeting)
+    store["meetings"].append(meeting)
+    store["current_id"] = meeting["id"]
+    AUTHOR_PATH.write_text("", encoding="utf-8")
+    save_store(store)
+    rebuild_markdown(store)
+    print(json.dumps(meeting, ensure_ascii=False))
+
+
+def rename_meeting(meeting_id, name):
+    name = clean(name)
+    if not name:
+        raise ValueError("Meeting name is required")
+    store = load_store()
+    meeting = next((item for item in store["meetings"] if item["id"] == meeting_id), None)
+    if meeting is None:
+        raise ValueError("Meeting not found")
+    previous_path = meeting_path(meeting)
+    meeting["name"] = name
+    meeting["updated_at"] = now_iso()
+    meeting["file_name"] = meeting_filename(meeting)
+    renamed_path = meeting_path(meeting)
+    if previous_path.exists() and previous_path != renamed_path and not renamed_path.exists():
+        previous_path.rename(renamed_path)
+    save_store(store)
+    rebuild_markdown(store)
+    print(json.dumps(meeting, ensure_ascii=False))
+
+
+def select_meeting(meeting_id):
+    store = load_store()
+    if meeting_id not in {meeting["id"] for meeting in store["meetings"]}:
+        raise ValueError("Meeting not found")
+    store["current_id"] = meeting_id
+    save_store(store)
+    print(json.dumps(current_meeting(store), ensure_ascii=False))
+
+
+def delete_meeting(meeting_id):
+    store = load_store()
+    if len(store["meetings"]) <= 1:
+        raise ValueError("At least one meeting must remain")
+    meeting = next((item for item in store["meetings"] if item["id"] == meeting_id), None)
+    if meeting is None:
+        raise ValueError("Meeting not found")
+
+    all_entries = read_entries()
+    deleted_entries = [entry for entry in all_entries if entry.get("meeting_id") == meeting_id]
+    remaining_entries = [entry for entry in all_entries if entry.get("meeting_id") != meeting_id]
+    deleted_at = now_iso()
+    archive_stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    DELETED_DIR.mkdir(parents=True, exist_ok=True)
+    archive_path = DELETED_DIR / f"{meeting_id}-{archive_stamp}.json"
+    archive_path.write_text(json.dumps({
+        "deleted_at": deleted_at,
+        "meeting": meeting,
+        "entries": deleted_entries,
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    markdown_path = meeting_path(meeting)
+    if markdown_path.exists():
+        archived_markdown = DELETED_DIR / f"{meeting['file_name']}.{archive_stamp}.deleted"
+        shutil.move(str(markdown_path), str(archived_markdown))
+
+    store["meetings"] = [item for item in store["meetings"] if item["id"] != meeting_id]
+    if store["current_id"] == meeting_id:
+        store["current_id"] = store["meetings"][-1]["id"]
+    write_entries(remaining_entries)
+    save_store(store)
+    rebuild_markdown(store, remaining_entries)
+    print(json.dumps({
+        "deleted": meeting,
+        "current": current_meeting(store),
+        "archive": str(archive_path),
+    }, ensure_ascii=False))
+
+
+def set_directory(value):
+    value = str(value).strip()
+    if not value:
+        raise ValueError("Notes folder is required")
+    destination = Path(os.path.expandvars(value)).expanduser()
+    if not destination.is_absolute():
+        destination = Path.home() / destination
+    destination.mkdir(parents=True, exist_ok=True)
+    if not destination.is_dir():
+        raise ValueError("Notes folder is not a directory")
+    store = load_store()
+    save_config(destination)
+    rebuild_markdown(store)
+    print(destination)
+
+
+def open_log():
+    store = load_store()
+    rebuild_markdown(store)
+    path = meeting_path(current_meeting(store))
+    attempts = []
+    if shutil.which("omawrite"):
+        attempts.append(["omawrite", str(path)])
+    if shutil.which("omarchy-launch-editor"):
+        attempts.append(["omarchy-launch-editor", str(path)])
+    for command in attempts:
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            try:
+                return_code = process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                print(path)
+                return
+        except OSError as error:
+            last_error = str(error)
+            continue
+        if return_code == 0:
+            print(path)
+            return
+        last_error = f"{command[0]} exited with status {return_code}"
+    raise RuntimeError(locals().get("last_error", "No application is available to open the meeting log"))
+
+
+def main():
+    command = sys.argv[1] if len(sys.argv) > 1 else "state"
+    if command == "add":
+        if len(sys.argv) != 4:
+            raise ValueError("Usage: meeting-notes add AUTHOR NOTE")
+        add(sys.argv[2], sys.argv[3])
+    elif command == "state":
+        state(int(sys.argv[2]) if len(sys.argv) > 2 else 8)
+    elif command == "list":
+        list_recent(int(sys.argv[2]) if len(sys.argv) > 2 else 8)
+    elif command == "create":
+        if len(sys.argv) != 3:
+            raise ValueError("Usage: meeting-notes create NAME")
+        create_meeting(sys.argv[2])
+    elif command == "rename":
+        if len(sys.argv) != 4:
+            raise ValueError("Usage: meeting-notes rename ID NAME")
+        rename_meeting(sys.argv[2], sys.argv[3])
+    elif command == "select":
+        if len(sys.argv) != 3:
+            raise ValueError("Usage: meeting-notes select ID")
+        select_meeting(sys.argv[2])
+    elif command == "delete":
+        if len(sys.argv) != 3:
+            raise ValueError("Usage: meeting-notes delete ID")
+        delete_meeting(sys.argv[2])
+    elif command == "set-directory":
+        if len(sys.argv) != 3:
+            raise ValueError("Usage: meeting-notes set-directory PATH")
+        set_directory(sys.argv[2])
+    elif command == "author":
+        print(AUTHOR_PATH.read_text(encoding="utf-8").strip() if AUTHOR_PATH.exists() else "")
+    elif command == "path":
+        store = load_store()
+        rebuild_markdown(store)
+        print(meeting_path(current_meeting(store)))
+    elif command == "open":
+        open_log()
+    else:
+        raise ValueError(f"Unknown command: {command}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(str(error), file=sys.stderr)
+        raise SystemExit(1)
