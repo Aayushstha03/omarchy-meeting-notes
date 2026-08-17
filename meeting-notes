@@ -407,6 +407,7 @@ def open_log():
 
 
 def main():
+    os.umask(0o077)
     command = sys.argv[1] if len(sys.argv) > 1 else "state"
     if command == "add":
         if len(sys.argv) != 4:
