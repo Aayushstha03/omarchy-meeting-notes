@@ -265,7 +265,7 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "✎"
+    text: ""
     tooltipText: "Meeting notes"
     onPressed: function(b) {
       if (b === Qt.RightButton) {
